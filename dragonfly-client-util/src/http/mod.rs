@@ -122,8 +122,17 @@ pub fn validate_ranged_response(
         }))
     };
 
-    let expected_end = range.start + range.length - 1;
-    if status_code != StatusCode::PARTIAL_CONTENT {
+    let expected_end = range
+        .length
+        .checked_sub(1)
+        .and_then(|length| range.start.checked_add(length))
+        .ok_or_else(|| err("invalid or overflowing requested range".to_string()))?;
+    // ModelScope can return a partial body with 200 rather than 206. Only
+    // accept that shape when Content-Range and Content-Length prove it is the
+    // exact requested piece. Keep the existing full-body fallback unchanged.
+    let compatible_partial =
+        status_code == StatusCode::OK && response_header.contains_key(CONTENT_RANGE);
+    if status_code != StatusCode::PARTIAL_CONTENT && !compatible_partial {
         if range.start == 0 {
             return Ok(());
         }
@@ -159,6 +168,23 @@ pub fn validate_ranged_response(
         )));
     }
 
+    if compatible_partial {
+        let total = content_range
+            .split_once('/')
+            .and_then(|(_, total)| total.parse::<u64>().ok())
+            .filter(|total| *total > actual_end);
+        let length = response_header
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|length| length.to_str().ok())
+            .and_then(|length| length.parse::<u64>().ok());
+        if total.is_none() || length != Some(range.length) {
+            return Err(err(format!(
+                "invalid 200 partial response: Content-Range {content_range}, expected Content-Length {}",
+                range.length
+            )));
+        }
+    }
+
     Ok(())
 }
 
@@ -168,6 +194,69 @@ mod tests {
 
     use super::*;
     use reqwest::header::RANGE;
+
+    #[test]
+    fn modelscope_200_ranges_require_matching_bounds_total_and_length() {
+        let cases = [
+            (10, 20, "bytes 10-29/2127", "20", true),
+            (0, 1, "bytes 0-0/2127", "1", true),
+            (0, 1, "bytes 1-1/2127", "1", false),
+            (10, 20, "bytes 0-19/2127", "20", false),
+            (10, 20, "bytes 10-29/2127", "1", false),
+            (10, 20, "bytes 10-29/*", "20", false),
+            (10, 20, "bytes 10-29/29", "20", false),
+            (10, 20, "bytes 10-29/invalid", "20", false),
+            (10, 20, "bytes 10-29/invalid/2127", "20", false),
+            (0, 1, "invalid", "1", false),
+        ];
+        for (start, length, content_range, content_length, valid) in cases {
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_RANGE, content_range.parse().unwrap());
+            headers.insert(
+                reqwest::header::CONTENT_LENGTH,
+                content_length.parse().unwrap(),
+            );
+            assert_eq!(
+                validate_ranged_response(Some(Range { start, length }), StatusCode::OK, &headers)
+                    .is_ok(),
+                valid,
+                "Content-Range: {content_range}, Content-Length: {content_length}"
+            );
+        }
+    }
+
+    #[test]
+    fn modelscope_200_range_rejects_missing_length_and_overflow() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_RANGE, HeaderValue::from_static("bytes 0-0/2127"));
+        assert!(validate_ranged_response(
+            Some(Range {
+                start: 0,
+                length: 1
+            }),
+            StatusCode::OK,
+            &headers
+        )
+        .is_err());
+        assert!(validate_ranged_response(
+            Some(Range {
+                start: 0,
+                length: 0
+            }),
+            StatusCode::OK,
+            &headers
+        )
+        .is_err());
+        assert!(validate_ranged_response(
+            Some(Range {
+                start: u64::MAX,
+                length: 2
+            }),
+            StatusCode::OK,
+            &headers
+        )
+        .is_err());
+    }
 
     #[test]
     fn headermap_to_hashmap_keeps_visible_ascii_values() {

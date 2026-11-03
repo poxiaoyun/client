@@ -594,7 +594,33 @@ impl Backend for HTTP {
 
         let response_status_code = response.status();
         let mut response_header = response.headers().clone();
-        let content_length = if response_status_code == reqwest::StatusCode::PARTIAL_CONTENT {
+        // Some ModelScope endpoints honor Range but respond with 200. Validate
+        // the one-byte probe before treating its headers as a partial response;
+        // otherwise Content-Length: 1 would poison the shared task metadata.
+        let compatible_partial = response_status_code == reqwest::StatusCode::OK
+            && response_header.contains_key(CONTENT_RANGE);
+        if compatible_partial {
+            if let Err(err) = validate_ranged_response(
+                Some(Range {
+                    start: 0,
+                    length: 1,
+                }),
+                response_status_code,
+                &response_header,
+            ) {
+                return Ok(StatResponse {
+                    success: false,
+                    content_length: None,
+                    http_header: Some(response_header),
+                    http_status_code: Some(response_status_code),
+                    entries: Vec::new(),
+                    error_message: Some(err.to_string()),
+                });
+            }
+        }
+        let partial_response =
+            response_status_code == reqwest::StatusCode::PARTIAL_CONTENT || compatible_partial;
+        let content_length = if partial_response {
             // The total length of a ranged response is in the Content-Range header,
             // e.g. "bytes 0-0/1048576".
             let content_length = response_header
@@ -613,6 +639,16 @@ impl Backend for HTTP {
             // Read the one-byte body to completion, so the connection can be reused by
             // the connection pool instead of being closed with an unread body.
             if let Err(err) = response.bytes().await {
+                if compatible_partial {
+                    return Ok(StatResponse {
+                        success: false,
+                        content_length: None,
+                        http_header: Some(response_header),
+                        http_status_code: Some(response_status_code),
+                        entries: Vec::new(),
+                        error_message: Some(err.to_string()),
+                    });
+                }
                 debug!(
                     "stat request failed to read response body {} {}: {}",
                     request.task_id, request_url, err
@@ -1098,6 +1134,34 @@ LJ8gCHKBOJy9dW62DcRWw6zzlTtt9y18/Btx0Hpawg==
 
         let test_cases: Vec<(Vec<Mock>, fn(StatResponse))> = vec![
             (
+                vec![Mock::given(method("GET"))
+                    .and(path("/stat"))
+                    .and(header("range", "bytes=0-0"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .insert_header("Content-Range", "bytes 0-0/2127")
+                            .set_body_bytes(vec![b'*']),
+                    )],
+                |response| {
+                    assert!(response.success);
+                    assert_eq!(response.content_length, Some(2127));
+                    let headers = response.http_header.unwrap();
+                    assert!(headers.get("content-range").is_none());
+                    assert_eq!(headers.get("content-length").unwrap(), "2127");
+                },
+            ),
+            (
+                vec![Mock::given(method("GET")).and(path("/stat")).respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Content-Range", "bytes 1-1/2127")
+                        .set_body_bytes(vec![b'*']),
+                )],
+                |response| {
+                    assert!(!response.success);
+                    assert_eq!(response.content_length, None);
+                },
+            ),
+            (
                 vec![Mock::given(method("GET")).and(path("/stat")).respond_with(
                     ResponseTemplate::new(200)
                         .insert_header("Content-Type", "text/html; charset=UTF-8"),
@@ -1242,6 +1306,24 @@ LJ8gCHKBOJy9dW62DcRWw6zzlTtt9y18/Btx0Hpawg==
         install_crypto_provider();
 
         let test_cases: Vec<(Vec<Mock>, Option<Range>, fn(GetResponse<Body>, &str))> = vec![
+            (
+                vec![Mock::given(method("GET"))
+                    .and(path("/get"))
+                    .and(header("range", "bytes=10-29"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .insert_header("Content-Range", "bytes 10-29/2127")
+                            .set_body_string("01234567890123456789"),
+                    )],
+                Some(Range {
+                    start: 10,
+                    length: 20,
+                }),
+                |response, body| {
+                    assert!(response.success);
+                    assert_eq!(body, "01234567890123456789");
+                },
+            ),
             (
                 vec![Mock::given(method("GET")).and(path("/get")).respond_with(
                     ResponseTemplate::new(200)
