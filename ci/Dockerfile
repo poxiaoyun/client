@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1
+
 FROM rust:1.88.0 AS builder
 
 WORKDIR /app/client
@@ -41,10 +43,32 @@ COPY dragonfly-client-init/Cargo.toml ./dragonfly-client-init/Cargo.toml
 COPY dragonfly-client-init/src ./dragonfly-client-init/src
 
 ARG TARGETPLATFORM
-RUN case "${TARGETPLATFORM}" in \
-  "linux/arm64") export JEMALLOC_SYS_WITH_LG_PAGE=16;; \
-  esac && \
-  cargo build --release --verbose --bin dfget --bin dfdaemon --bin dfcache --bin dfstore --bin dfctl
+ARG TARGETARCH
+ARG TARGETVARIANT
+ARG CARGO_BUILD_JOBS=1
+# RUSTFLAGS overrides .cargo/config.toml, so retain its tokio_unstable flag.
+# The Debian GNU linker can trade repeated reads for lower memory usage.
+ENV RUSTFLAGS="--cfg tokio_unstable -C link-arg=-Wl,--no-keep-memory" \
+    CMAKE_BUILD_PARALLEL_LEVEL=1 \
+    MAKEFLAGS=-j1
+
+# Keep dependency artifacts across source changes, isolated by architecture.
+# Export binaries outside the cache mount for the final image stage.
+RUN --mount=type=cache,id=dragonfly-registry-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=dragonfly-git-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=dragonfly-target-release-rust1.88-${TARGETARCH}${TARGETVARIANT},target=/app/client/target,sharing=locked \
+    set -eu; \
+    case "${TARGETPLATFORM}" in \
+      "linux/arm64") export JEMALLOC_SYS_WITH_LG_PAGE=16;; \
+    esac; \
+    # COPY mtimes may be older than cached artifacts: refresh local sources.
+    find dragonfly-client* -type f -name '*.rs' -exec touch {} +; \
+    cargo build --locked --release --jobs "${CARGO_BUILD_JOBS}" \
+      --bin dfget --bin dfdaemon --bin dfcache --bin dfstore --bin dfctl; \
+    install -d /out; \
+    for binary in dfget dfdaemon dfcache dfstore dfctl; do \
+      install "target/release/${binary}" "/out/${binary}"; \
+    done
 
 FROM alpine:3.23.4@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11 AS health
 
@@ -65,11 +89,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     dstat iperf fio dnsutils iputils-ping lsof strace net-tools procps apache2-utils \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/client/target/release/dfget /usr/local/bin/dfget
-COPY --from=builder /app/client/target/release/dfdaemon /usr/local/bin/dfdaemon
-COPY --from=builder /app/client/target/release/dfcache /usr/local/bin/dfcache
-COPY --from=builder /app/client/target/release/dfstore /usr/local/bin/dfstore
-COPY --from=builder /app/client/target/release/dfctl /usr/local/bin/dfctl
+COPY --from=builder /out/dfget /usr/local/bin/dfget
+COPY --from=builder /out/dfdaemon /usr/local/bin/dfdaemon
+COPY --from=builder /out/dfcache /usr/local/bin/dfcache
+COPY --from=builder /out/dfstore /usr/local/bin/dfstore
+COPY --from=builder /out/dfctl /usr/local/bin/dfctl
 COPY --from=health /bin/grpc_health_probe /bin/grpc_health_probe
 
 ENTRYPOINT ["/usr/local/bin/dfdaemon"]
